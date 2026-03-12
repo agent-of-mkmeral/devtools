@@ -3,6 +3,8 @@
 # Dependencies
 node_modules/
 
+__pycache__
+
 # CDK output
 cdk.out/
 
@@ -30,3 +32,5 @@ package-lock.json
 
 # Environment variables (contains secrets)
 .env
+
+.claude/settings.json
