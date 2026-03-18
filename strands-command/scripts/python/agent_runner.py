@@ -35,7 +35,6 @@ from github_tools import (
     list_issues,
     list_pull_requests,
     reply_to_review_comment,
-    submit_pr_review,
     update_issue,
     update_pull_request,
 )
@@ -175,7 +174,6 @@ def _get_all_tools() -> list[Any]:
         get_pr_review_and_comments,
         reply_to_review_comment,
         add_pr_comment,
-        submit_pr_review,
         
         # Agent tools
         notebook,
