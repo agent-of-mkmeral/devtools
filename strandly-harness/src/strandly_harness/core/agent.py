@@ -155,7 +155,16 @@ async def build_agent(
     # reinject only ever removes/re-appends that one text block), so the cache point stays between
     # the stable base and the churning skills block.
     agent.system_prompt = [
-        {"text": compose(system_prompt, tool_names=agent.tool_names)},
+        {
+            "text": compose(
+                system_prompt,
+                tool_names=agent.tool_names,
+                # The AgentCore sandbox's filesystem doesn't survive across separate invocations;
+                # the local sandbox is the user's real disk (persists). Tell the agent to persist
+                # work out of an ephemeral sandbox only in the former case.
+                ephemeral_sandbox=config.use_agentcore_sandbox,
+            )
+        },
         MODEL_SYSTEM_CACHE_POINT,
     ]
     return agent

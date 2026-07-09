@@ -9,6 +9,10 @@ lifecycle independent of the presentation layer (dashboard) and the trigger laye
   (not a cross-stack import, which would deadlock a Data re-deploy); deleting the dashboard leaves
   the data intact.
 - **dedup** — the mention poller's durable dispatch backstop. The ingress stack references it by name.
+- **mention-log** — one row per ``@mention`` the poller processed (dispatched / unauthorized /
+  stale, ...), written by the poller and read by the dashboard's Mentions tab. Same "recent" GSI
+  shape as the run-ledger (constant ``gsi_pk`` + ISO sort key) so the dashboard lists newest-first
+  with a single Query.
 
 Both are ``PAY_PER_REQUEST`` and carry ``RETAIN`` on prod / ``DESTROY`` elsewhere — telemetry and a
 dedup backstop are cheap to recreate in dev but shouldn't vanish from prod on a stack delete.
@@ -20,7 +24,7 @@ from aws_cdk import CfnOutput, RemovalPolicy, Stack
 from aws_cdk import aws_dynamodb as dynamodb
 from constructs import Construct
 
-from .common import RUN_LEDGER_GSI, Naming
+from .common import MENTION_LOG_GSI, RUN_LEDGER_GSI, Naming
 
 
 class DataStack(Stack):
@@ -63,5 +67,25 @@ class DataStack(Stack):
             removal_policy=removal,
         )
 
+        # Mention log: every @mention the poller processed, for the dashboard's Mentions tab.
+        # TTL-reaped like dedup (the log is a rolling window, not an archive — GitHub is durable).
+        self.mention_log = dynamodb.Table(
+            self,
+            "MentionLog",
+            table_name=naming.mention_log_table,
+            partition_key=dynamodb.Attribute(name="mention_id", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="ttl",
+            removal_policy=removal,
+        )
+        # Same newest-first Query shape as the run-ledger: constant gsi_pk="MENTION", ISO seen_at.
+        self.mention_log.add_global_secondary_index(
+            index_name=MENTION_LOG_GSI,
+            partition_key=dynamodb.Attribute(name="gsi_pk", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="seen_at", type=dynamodb.AttributeType.STRING),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+
         CfnOutput(self, "RunLedgerTableName", value=self.run_ledger.table_name)
         CfnOutput(self, "DedupTableName", value=self.dedup.table_name)
+        CfnOutput(self, "MentionLogTableName", value=self.mention_log.table_name)

@@ -1,10 +1,44 @@
 from __future__ import annotations
 
-from strandly_harness.core.config import Config
+from strandly_harness.core import config as config_mod
+from strandly_harness.core.config import Config, _region_from_secret_arn
 
 
 def _cfg(**values) -> Config:
     return Config(values=values)
+
+
+def test_region_from_secret_arn():
+    arn = "arn:aws:secretsmanager:us-west-2:111122223333:secret:strandly/prod/config-abc123"
+    assert _region_from_secret_arn(arn) == "us-west-2"
+    # A non-ARN / malformed value yields None rather than raising.
+    assert _region_from_secret_arn("not-an-arn") is None
+
+
+def test_load_secret_falls_back_to_arn_region_when_no_env_region(monkeypatch):
+    # Regression (prod): the AgentCore runtime container has no AWS_REGION, so a secret load that
+    # relies on the passed-in region raised NoRegionError and silently left the config empty (no
+    # GitHub token). The region baked into the ARN must be used as the fallback.
+    arn = "arn:aws:secretsmanager:eu-central-1:111122223333:secret:strandly/prod/config-abc123"
+    seen = {}
+
+    class _FakeClient:
+        def get_secret_value(self, SecretId):  # noqa: N803 — boto3 kwarg name
+            return {"SecretString": '{"STRANDLY_GITHUB_TOKEN": "ghp_x"}'}
+
+    class _FakeSession:
+        def __init__(self, region_name=None):
+            seen["region"] = region_name
+
+        def client(self, name):
+            return _FakeClient()
+
+    import boto3
+
+    monkeypatch.setattr(boto3, "Session", _FakeSession)
+    out = config_mod._load_secret(arn, None)  # None region → must derive from the ARN
+    assert seen["region"] == "eu-central-1"
+    assert out["STRANDLY_GITHUB_TOKEN"] == "ghp_x"
 
 
 def test_defaults_all_capabilities_off():
@@ -18,6 +52,17 @@ def test_defaults_all_capabilities_off():
 
 def test_github_gated_on_token():
     assert _cfg(STRANDLY_GITHUB_TOKEN="ghp_x").github_enabled is True
+
+
+def test_github_token_resolution_order():
+    # Same precedence as the use_github tool (GitHubSettings.token_env), but resolved through
+    # Config.get so a Secrets-Manager-only deployment (values dict, no process env) also finds it.
+    assert _cfg().github_token is None
+    assert _cfg(PAT_TOKEN="pat").github_token == "pat"
+    assert _cfg(GITHUB_TOKEN="gh", PAT_TOKEN="pat").github_token == "gh"
+    assert _cfg(STRANDLY_GITHUB_TOKEN="strandly", GITHUB_TOKEN="gh").github_token == "strandly"
+    # Empty strings are "unset", matching Config.get's falsy-to-None coercion.
+    assert _cfg(STRANDLY_GITHUB_TOKEN="", GITHUB_TOKEN="gh").github_token == "gh"
 
 
 def test_search_mcp_gated_on_url():
@@ -154,3 +199,16 @@ def test_github_allow_list_empty_env_falls_back_to_default():
 
     assert _cfg(STRANDLY_ALLOWED_OWNERS="").github.allowed_owners == STRANDS_ORG_OWNERS
     assert _cfg(STRANDLY_ALLOWED_OWNERS="  ,  ").github.allowed_owners == STRANDS_ORG_OWNERS
+
+
+def test_allowed_owners_accepts_bare_owners_and_repo_globs():
+    # STRANDLY_ALLOWED_OWNERS overrides the default and accepts both bare owners and owner/repo
+    # globs verbatim — the tool's matcher interprets them. This is how a deployment grants specific
+    # external repos (the AgentCore packages) without opening a whole org.
+    c = _cfg(STRANDLY_ALLOWED_OWNERS="strands-agents, aws/bedrock-agentcore-*, aws/agentcore-cli")
+    assert c.github.allowed_owners == ("strands-agents", "aws/bedrock-agentcore-*", "aws/agentcore-cli")
+
+
+def test_allowed_owners_defaults_to_strands_orgs():
+    from strandly_harness.core.constants import STRANDS_ORG_OWNERS
+    assert _cfg().github.allowed_owners == STRANDS_ORG_OWNERS

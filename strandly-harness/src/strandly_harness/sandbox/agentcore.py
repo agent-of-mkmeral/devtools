@@ -44,6 +44,8 @@ from strands.sandbox.types import ExecutionResult, FileInfo, OutputFile, StreamC
 from strandly_harness.core.constants import (
     SANDBOX_BOOTSTRAP_PACKAGES,
     SANDBOX_GIT_BIN,
+    SANDBOX_GIT_COMMIT_EMAIL,
+    SANDBOX_GIT_COMMIT_NAME,
     SANDBOX_GIT_PAGER_ENV,
     SANDBOX_GIT_PREFIX,
     SANDBOX_MICROMAMBA_URL,
@@ -170,6 +172,41 @@ echo "strandly-bootstrap: installed {pkg_args} -> {SANDBOX_GIT_PREFIX}"
 """
 
 
+def _git_credentials_script(token: str) -> str:
+    """A shell script that bootstraps the sandbox's git client with ``token`` for github.com.
+
+    Writes the standard git credential store (``~/.git-credentials`` + ``credential.helper store``)
+    so every native ``git clone``/``fetch``/``push`` against github.com authenticates as the same
+    identity the ``use_github`` tool writes with — no per-command token plumbing, and the agent can
+    use git exactly like a developer would (private clones, pushes, rebases). Also sets a commit
+    identity, without which ``git commit`` fails on the bare CI image.
+
+    Deliberate choices:
+
+    - **Credential store, not ``url.insteadOf``** — an embedded-token URL rewrite leaks the token
+      into every ``git config -l`` / error message; the credentials file is a single ``0600`` file
+      that a future rotation just overwrites.
+    - **``x-access-token`` basic-auth username** — works uniformly for classic PATs, fine-grained
+      PATs, and GitHub App installation tokens, so swapping the token type later (the plan is
+      GitHub App short-lived tokens) needs no change here.
+    - **The token never appears in the script's output** — only in the heredoc-quoted body sent to
+      ``executeCommand``. Callers must not log this script (see :meth:`_bootstrap_session`).
+    - **Idempotent** — rewrites the credential file and config unconditionally; safe to re-run and
+      naturally handles token rotation on a fresh session.
+    """
+    return f"""
+set -e
+export PATH={SANDBOX_GIT_BIN}:$PATH
+if ! command -v git >/dev/null 2>&1; then echo "strandly-bootstrap: git missing; skipping credentials"; exit 0; fi
+umask 077
+printf 'https://x-access-token:%s@github.com\\n' {shlex.quote(token)} > "$HOME/.git-credentials"
+git config --global credential.helper store
+git config --global user.name {shlex.quote(SANDBOX_GIT_COMMIT_NAME)}
+git config --global user.email {shlex.quote(SANDBOX_GIT_COMMIT_EMAIL)}
+echo "strandly-bootstrap: git credentials configured"
+"""
+
+
 def _block_is_dir(block: dict[str, Any]) -> bool | None:
     """Resolve whether a ``listFiles`` resource block is a directory, or ``None`` if unknown.
 
@@ -246,6 +283,7 @@ class AgentCoreSandbox(Sandbox):
         session_id: str | None = None,
         session_timeout_seconds: int | None = None,
         bootstrap_git: bool = True,
+        github_token: str | None = None,
         client: CodeInterpreter | None = None,
     ) -> None:
         """Initialize the AgentCore sandbox.
@@ -267,12 +305,22 @@ class AgentCoreSandbox(Sandbox):
                 every command gets ``$HOME/.gitenv/bin`` prepended to ``PATH``. Fail-open: a failed
                 install logs a warning and leaves the sandbox usable without git. Set ``False`` to
                 skip (e.g. a caller-owned session, or a backend that already ships git).
+            github_token: When set (and ``bootstrap_git`` is on), a fresh managed session also
+                bootstraps the git client with this token for github.com (credential store +
+                commit identity — see :func:`_git_credentials_script`), so native
+                ``git clone``/``push`` and any tool that shells out to git authenticate without
+                per-command plumbing. This deliberately places the token *inside* the sandbox:
+                agent-executed code can read it, and native pushes bypass the ``use_github``
+                guardrails — the token's own scope becomes the effective write policy, so prefer
+                a short-lived, repo-scoped token (e.g. a GitHub App installation token) over a
+                broad PAT. ``None`` (default) keeps the sandbox credential-free.
             client: A pre-built ``CodeInterpreter`` client. When omitted, one is
                 constructed lazily from ``region``.
         """
         self.identifier = identifier
         self.session_timeout_seconds = session_timeout_seconds
         self.bootstrap_git = bootstrap_git
+        self._github_token = github_token
         self._region = _resolve_region(region)
         self._client = client
         # We own (and therefore stop) only sessions we start ourselves: no explicit
@@ -390,11 +438,32 @@ class AgentCoreSandbox(Sandbox):
         per-command in :meth:`execute_streaming`, so a partial/failed install just means ``git``
         isn't found, not a broken shell. Runs in the worker thread under the client lock (we're
         already inside :meth:`_invoke_collect`), so it can call the sync client directly.
+
+        When a ``github_token`` was provided, a second best-effort step bootstraps the git client
+        with it (see :func:`_git_credentials_script`) so native git authenticates for the session's
+        life. Ordered after the install because it needs the ``git`` binary; each step fails open
+        independently.
         """
         try:
             self._invoke_drain(client, "executeCommand", {"command": _git_bootstrap_script()})
         except Exception as e:  # noqa: BLE001 — bootstrap is best-effort; never fail the turn
             logger.warning("sandbox git bootstrap failed (%s); continuing without git", e)
+        if self._github_token:
+            # Separate step + separate failure domain: a credential hiccup must not be conflated
+            # with a git-install failure, and vice versa. SECURITY: the script embeds the token, so
+            # never log the command; on failure log only the exception *type* — service validation
+            # errors can echo the offending input back in their message.
+            try:
+                self._invoke_drain(
+                    client,
+                    "executeCommand",
+                    {"command": _git_credentials_script(self._github_token)},
+                )
+            except Exception as e:  # noqa: BLE001 — best-effort, like the install above
+                logger.warning(
+                    "sandbox git credential bootstrap failed (%s); git will be unauthenticated",
+                    type(e).__name__,
+                )
 
     def warm_up(self) -> None:
         """Start the session + git bootstrap in the background so it overlaps the agent's first

@@ -26,6 +26,11 @@ KB_VECTOR_DISTANCE_METRIC = "cosine"
 # guard asserts all three agree — keep them in lockstep.
 RUN_LEDGER_GSI = "recent"
 
+# The "recent" GSI on the mention-log table + its constant partition value. Mirror
+# strandly_harness.core.constants.MENTION_LOG_GSI_NAME / MENTION_LOG_GSI_PK_VALUE (canonical) and
+# dashboard/api/handler.py's MENTION_LOG_GSI_NAME / MENTION_LOG_GSI_PK_VALUE — the sync test guards them.
+MENTION_LOG_GSI = "recent"
+
 # --- ABAC tag boundary for the sandbox's CI execution role (e2e testing) ---
 # The agent's sandbox role can only touch resources carrying MANAGED_BY_TAG_KEY == AGENT_TAG_VALUE,
 # and may only create resources if it tags them so. Prod backends are tagged INFRA_TAG_VALUE (a
@@ -98,6 +103,10 @@ class Naming:
     @property
     def dedup_table(self) -> str:
         return f"{self.hyphen}-dedup"
+
+    @property
+    def mention_log_table(self) -> str:
+        return f"{self.hyphen}-mentionlog"
 
     @property
     def poller_function(self) -> str:

@@ -33,6 +33,7 @@ class RuntimeIamStack(Stack):
         exec_role_name: str,
         kb_id: str | None = None,
         run_ledger_table: str | None = None,
+        config_secret_arn: str | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -87,6 +88,18 @@ class RuntimeIamStack(Stack):
                     resources=[
                         f"arn:aws:dynamodb:{self.region}:{self.account}:table/{run_ledger_table}"
                     ],
+                )
+            )
+        if config_secret_arn:
+            # Let the runtime read the config secret at startup (Config.load with STRANDLY_SECRETS_ARN)
+            # so rotating the GitHub token / backend ids is a secret update — no runtime redeploy. The
+            # toolkit-created exec role otherwise lacks Secrets Manager access. Granted on the exact
+            # (suffixed) secret ARN the runtime is deployed to read.
+            statements.append(
+                iam.PolicyStatement(
+                    sid="ConfigSecretRead",
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[config_secret_arn],
                 )
             )
 

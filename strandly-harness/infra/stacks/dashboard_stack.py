@@ -32,7 +32,7 @@ from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_s3_deployment as s3deploy
 from constructs import Construct
 
-from .common import RUN_LEDGER_GSI, Naming, dynamodb_table_arn
+from .common import MENTION_LOG_GSI, RUN_LEDGER_GSI, Naming, dynamodb_table_arn
 
 # infra/stacks/dashboard_stack.py -> repo root -> dashboard/
 _DASHBOARD_DIR = Path(__file__).resolve().parents[2] / "dashboard"
@@ -67,6 +67,16 @@ class DashboardStack(Stack):
             global_indexes=[RUN_LEDGER_GSI],
             grant_index_permissions=True,
         )
+        # The mention-log table (poller-written), read by the Mentions tab — same by-name pattern.
+        mention_log = dynamodb.Table.from_table_attributes(
+            self,
+            "MentionLogRef",
+            table_arn=dynamodb_table_arn(
+                naming.mention_log_table, region=self.region, account=self.account
+            ),
+            global_indexes=[MENTION_LOG_GSI],
+            grant_index_permissions=True,
+        )
 
         site_bucket, distribution = self._static_site()
         site_url = f"https://{distribution.distribution_domain_name}"
@@ -80,7 +90,7 @@ class DashboardStack(Stack):
 
         api = self._api(
             table, user_pool, user_pool_client, cognito_hosted_ui, site_url, naming, runtime_arn,
-            memory_id, actor_id,
+            memory_id, actor_id, mention_log=mention_log,
         )
         self._deploy_site(site_bucket, distribution, api, user_pool_client, cognito_hosted_ui)
         self._outputs(table, distribution, api, user_pool, user_pool_client, cognito_hosted_ui)
@@ -204,6 +214,7 @@ class DashboardStack(Stack):
         runtime_arn: str | None = None,
         memory_id: str | None = None,
         actor_id: str | None = None,
+        mention_log: dynamodb.ITable | None = None,
     ) -> apigw.HttpApi:
         fn = lambda_.Function(
             self,
@@ -223,19 +234,24 @@ class DashboardStack(Stack):
         )
         table.grant_read_data(fn)
 
-        # Overview health strip: the read Lambda may describe THIS deployment's alarms (the
-        # MonitoringStack names them all "<naming.hyphen>-…", so the prefix both scopes the
-        # DescribeAlarms call and the IAM resource). Alarms are always created by Monitoring, so
-        # this is unconditional; if Monitoring isn't deployed the call just returns an empty list
-        # and /api/health degrades cleanly.
+        # Mentions tab: read-only on the poller-written mention log (GSI Query via grant_read_data).
+        if mention_log is not None:
+            fn.add_environment("MENTION_LOG_TABLE", mention_log.table_name)
+            mention_log.grant_read_data(fn)
+
+        # Overview health strip: the read Lambda may describe THIS deployment's alarms. The
+        # MonitoringStack names them all "<naming.hyphen>-…", and the handler passes that prefix as
+        # the DescribeAlarms `AlarmNamePrefix` so only this deployment's alarms come back. The IAM
+        # resource, though, MUST be "*": cloudwatch:DescribeAlarms is a list-style action that does
+        # not support resource-level permissions, so scoping it to an alarm ARN denies the call
+        # outright (AccessDenied). Alarms are always created by Monitoring, so this is unconditional;
+        # if Monitoring isn't deployed the call just returns an empty list and /api/health degrades.
         alarm_prefix = f"{naming.hyphen}-"
         fn.add_environment("ALARM_NAME_PREFIX", alarm_prefix)
         fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["cloudwatch:DescribeAlarms"],
-                resources=[
-                    f"arn:aws:cloudwatch:{self.region}:{self.account}:alarm:{alarm_prefix}*"
-                ],
+                resources=["*"],
             )
         )
 
@@ -314,6 +330,7 @@ class DashboardStack(Stack):
             "/api/runs/{id}/logs",
             "/api/sessions",
             "/api/sessions/{id}",
+            "/api/mentions",
             "/api/chat",
         ):
             http_api.add_routes(

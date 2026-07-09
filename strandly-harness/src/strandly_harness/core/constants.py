@@ -160,6 +160,18 @@ SANDBOX_GIT_PAGER_ENV = "GIT_PAGER=cat PAGER=cat"
 SANDBOX_MICROMAMBA_URL = "https://micro.mamba.pm/api/micromamba/linux-aarch64/latest"
 # conda-forge packages installed into the session on bootstrap (real git, not a shim → push works).
 SANDBOX_BOOTSTRAP_PACKAGES = ("git",)
+# Commit identity written into the sandbox's global git config at credential bootstrap. Without
+# it, `git commit` fails ("Please tell me who you are") on the bare CI image. A generic-but-honest
+# bot identity; pushes authenticate as whatever account owns the bootstrapped token regardless.
+SANDBOX_GIT_COMMIT_NAME = "strandly"
+SANDBOX_GIT_COMMIT_EMAIL = "strandly@users.noreply.github.com"
+# Code Interpreter session lifetime, in seconds. The SDK/service default is 900 (15 min), which
+# reaps the sandbox mid-run on long build-a-PR tasks (explore → write → test → push) — observed
+# killing a real run at ~910s. We pin the service maximum (8h) so a long autonomous run isn't cut
+# off by the sandbox; the fire-and-forget async job cap (also 8h) is the real outer bound. NOTE:
+# this does NOT make the filesystem persist across separate invokes — a new session still starts
+# clean; it only keeps ONE session alive longer. Cross-invoke persistence is a separate concern.
+SANDBOX_SESSION_TIMEOUT_SECONDS = 28800
 # Long-term memory KB: an S3 Vectors index + a Bedrock KB over Titan embeddings. Titan v2 emits
 # 1024-dim float32 vectors; cosine is the recommended metric for text embeddings.
 KB_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0"
@@ -172,6 +184,14 @@ KB_VECTOR_DISTANCE_METRIC = "cosine"
 # dashboard Lambda handler (standalone bundle), and the run-ledger writer reads it here. The
 # tests/test_infra_constants_sync.py guard asserts all mirrors equal this.
 RUN_LEDGER_GSI_NAME = "recent"
+
+# --- mention-log DynamoDB (dashboard "Mentions" tab) ---
+# One row per mention the poller processed (dispatched, unauthorized, stale, ...), so the dashboard
+# can show every @mention of the agent and whether its author was authorized. Same mirroring rules
+# as the run-ledger constants above: the CDK DataStack and the dashboard Lambda copy these values
+# (they can't import this module); tests/test_infra_constants_sync.py guards the mirrors.
+MENTION_LOG_GSI_NAME = "recent"
+MENTION_LOG_GSI_PK_VALUE = "MENTION"
 
 # --- environment detection (local vs Bedrock AgentCore) ---
 AGENTCORE_CODE_INTERPRETER_ENV = "AGENTCORE_CODE_INTERPRETER_ID"

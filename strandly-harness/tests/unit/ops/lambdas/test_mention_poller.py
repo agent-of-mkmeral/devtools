@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from strandly_harness.core.config import Config, MentionPollerSettings
-from strandly_harness.ops.lambdas.mention_poller import dedup
+from strandly_harness.ops.lambdas.mention_poller import dedup, mention_log
 from strandly_harness.ops.lambdas.mention_poller import handler as mentions
 
 NOW = datetime(2026, 6, 26, 12, 0, 0, tzinfo=timezone.utc)
@@ -68,7 +68,9 @@ def test_select_mention_in_body():
     )
     assert m is not None
     assert m.author == "mkmeral" and m.source == "body"
-    assert m.timestamp == "2026-06-26T10:00:00Z"  # updated_at wins over created_at (edits count)
+    # created_at, NOT updated_at: a PR/issue's updated_at is bumped by ANY activity (comments,
+    # labels), which would make the body perpetually "fresh" and shadow real follow-up comments.
+    assert m.timestamp == "2026-06-26T09:00:00Z"
 
 
 def test_select_mention_picks_latest_comment_and_is_case_insensitive():
@@ -101,9 +103,9 @@ def test_select_mention_newest_wins_across_locations():
 
 
 def test_select_mention_body_wins_when_newest():
-    # When the body mention is the newest (e.g. it was just edited), it still wins.
-    content = {"body": "@agent-of-mkmeral edited", "user": {"login": "mkmeral"},
-               "updated_at": "2026-06-26T12:00:00Z"}
+    # When the body mention is genuinely the newest (by created_at), it still wins.
+    content = {"body": "@agent-of-mkmeral in body", "user": {"login": "mkmeral"},
+               "created_at": "2026-06-26T12:00:00Z"}
     comments = [{"body": "@agent-of-mkmeral earlier", "user": {"login": "alice"},
                  "updated_at": "2026-06-26T11:00:00Z"}]
     m = mentions.select_mention(
@@ -111,6 +113,28 @@ def test_select_mention_body_wins_when_newest():
         handle="agent-of-mkmeral", is_pull_request=True,
     )
     assert m is not None and m.source == "body" and m.timestamp == "2026-06-26T12:00:00Z"
+
+
+def test_select_mention_body_updated_at_does_not_shadow_comment():
+    # Regression (prod, devtools#75): a PR whose BODY merely links @handle, plus a real follow-up
+    # COMMENT asking for a review. GitHub bumps the PR's updated_at to the comment's time on every
+    # comment, so keying the body off updated_at made it tie the comment and win by precedence —
+    # attributing the mention to the PR *opener* (unauthorized) instead of the commenter. The body
+    # must be keyed off created_at so the genuine comment wins.
+    content = {
+        "body": "imports the harness. it currently powers @agent-of-mkmeral.",
+        "user": {"login": "agent-of-mkmeral"},   # the PR opener (a bot, not on the allow-list)
+        "created_at": "2026-06-26T09:00:00Z",
+        "updated_at": "2026-06-26T11:00:00Z",     # bumped by the comment below
+    }
+    comments = [{"body": "@agent-of-mkmeral can you review this?", "user": {"login": "mkmeral"},
+                 "created_at": "2026-06-26T11:00:00Z", "updated_at": "2026-06-26T11:00:00Z"}]
+    m = mentions.select_mention(
+        content=content, comments=comments, reviews=[], review_comments=[],
+        handle="agent-of-mkmeral", is_pull_request=True,
+    )
+    assert m is not None and m.source == "comment"
+    assert m.author == "mkmeral"  # the commenter who actually invoked the bot, not the PR opener
 
 
 def test_select_mention_tie_breaks_to_precedence():
@@ -347,7 +371,9 @@ class FakeDynamo:
         self.puts.append(Item)
         if self.raise_on_put:
             raise RuntimeError("boom")
-        self.items[Item["thread_id"]["S"]] = Item
+        # Dedup rows key on thread_id; mention-log rows on mention_id — store either.
+        key = Item.get("thread_id") or Item.get("mention_id")
+        self.items[key["S"]] = Item
 
     def delete_item(self, TableName, Key, **kw):  # noqa: N803
         if getattr(self, "raise_on_delete", False):
@@ -1023,3 +1049,122 @@ def test_process_duplicate_when_losing_intent_race(monkeypatch):
     assert outcome == "duplicate"
     assert dispatched == []  # no double-fire into the live session
     assert marked == []  # the winner owns mark_read
+
+
+# ---- mention log (dashboard Mentions tab) ------------------------------------------------
+
+
+def _log_rows(client: FakeDynamo) -> list[dict[str, Any]]:
+    """The mention-log puts a FakeDynamo saw (dedup rows key on thread_id, log rows on mention_id)."""
+    return [p for p in client.puts if "mention_id" in p]
+
+
+def test_process_logs_dispatched_mention(monkeypatch, wired):
+    monkeypatch.setattr(mentions, "gather_subject", lambda *a, **k: _gather())
+    client = FakeDynamo()
+    outcome = mentions.process_notification(
+        _pr_notification(last_read_at="2026-06-26T10:00:00Z"),
+        settings=_settings(mention_log_table="ML"), token="tok", ddb_client=client, now=NOW,
+    )
+    assert outcome == "dispatched"
+    rows = _log_rows(client)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["outcome"]["S"] == "dispatched"
+    assert row["authorized"]["BOOL"] is True
+    assert row["author"]["S"] == "mkmeral"
+    assert row["repo"]["S"] == "ext/repo"
+    assert row["number"]["N"] == "42"
+    assert row["is_pull_request"]["BOOL"] is True
+    assert row["gsi_pk"]["S"] == "MENTION"  # constant partition for the "recent" GSI
+    assert row["session_id"]["S"] == "gh-ext-repo-pr-42"
+    assert row["url"]["S"] == "https://github.com/ext/repo/pull/42"
+    assert row["mention_ts"]["S"] == "2026-06-26T11:00:00Z"
+    assert "ttl" in row and row["ttl"]["N"].isdigit()
+
+
+def test_process_logs_unauthorized_mention(monkeypatch, wired):
+    # The whole point of the tab: an unauthorized mention is visible with authorized=False.
+    monkeypatch.setattr(mentions, "gather_subject", lambda *a, **k: _gather(author="eve"))
+    client = FakeDynamo()
+    outcome = mentions.process_notification(
+        _pr_notification(), settings=_settings(mention_log_table="ML"),
+        token="tok", ddb_client=client, now=NOW,
+    )
+    assert outcome == "unauthorized"
+    rows = _log_rows(client)
+    assert len(rows) == 1
+    assert rows[0]["outcome"]["S"] == "unauthorized"
+    assert rows[0]["authorized"]["BOOL"] is False
+    assert rows[0]["author"]["S"] == "eve"
+    assert "session_id" not in rows[0]  # nothing was dispatched
+
+
+def test_process_logs_stale_mention(monkeypatch, wired):
+    monkeypatch.setattr(mentions, "gather_subject", lambda *a, **k: _gather(ts="2026-06-26T08:00:00Z"))
+    client = FakeDynamo()
+    outcome = mentions.process_notification(
+        _pr_notification(last_read_at="2026-06-26T10:00:00Z"),
+        settings=_settings(mention_log_table="ML"), token="tok", ddb_client=client, now=NOW,
+    )
+    assert outcome == "stale"
+    rows = _log_rows(client)
+    assert len(rows) == 1 and rows[0]["outcome"]["S"] == "stale"
+
+
+def test_process_logs_dispatch_error(monkeypatch):
+    monkeypatch.setattr(mentions, "mark_read", lambda tid, token: None)
+    monkeypatch.setattr(mentions, "dispatch", lambda *a, **k: {"status": "error"})
+    monkeypatch.setattr(mentions, "gather_subject", lambda *a, **k: _gather())
+    client = FakeDynamo()
+    outcome = mentions.process_notification(
+        _pr_notification(last_read_at="2026-06-26T10:00:00Z"),
+        settings=_settings(mention_log_table="ML"), token="tok", ddb_client=client, now=NOW,
+    )
+    assert outcome == "dispatch-error"
+    rows = _log_rows(client)
+    assert len(rows) == 1 and rows[0]["outcome"]["S"] == "dispatch-error"
+    assert rows[0]["session_id"]["S"] == "gh-ext-repo-pr-42"
+
+
+def test_process_no_log_rows_without_table(monkeypatch, wired):
+    # Feature off (no table configured) → zero mention-log writes, dispatch unaffected.
+    monkeypatch.setattr(mentions, "gather_subject", lambda *a, **k: _gather())
+    client = FakeDynamo()
+    outcome = mentions.process_notification(
+        _pr_notification(last_read_at="2026-06-26T10:00:00Z"),
+        settings=_settings(dedup_table="T"), token="tok", ddb_client=client, now=NOW,
+    )
+    assert outcome == "dispatched"
+    assert _log_rows(client) == []
+
+
+def test_mention_log_write_failure_never_blocks_dispatch(monkeypatch, wired):
+    # FAIL-OPEN: a broken mention-log table must not change the outcome or suppress mark-read.
+    monkeypatch.setattr(mentions, "gather_subject", lambda *a, **k: _gather())
+    client = FakeDynamo(raise_on_put=True)  # no dedup table → only the log write hits put_item
+    outcome = mentions.process_notification(
+        _pr_notification(last_read_at="2026-06-26T10:00:00Z"),
+        settings=_settings(mention_log_table="ML"), token="tok", ddb_client=client, now=NOW,
+    )
+    assert outcome == "dispatched"
+    assert wired.dispatched and wired.marked_read == ["thread-1"]
+    assert client.puts  # it tried
+
+
+def test_mention_log_record_noop_without_table_or_client():
+    client = FakeDynamo()
+    mention_log.record(client, None, thread_id="t", outcome="x", authorized=True)
+    mention_log.record(None, "ML", thread_id="t", outcome="x", authorized=True)
+    assert client.puts == []
+
+
+def test_mention_log_record_clips_body_and_skips_empty_optionals():
+    client = FakeDynamo()
+    mention_log.record(
+        client, "ML", thread_id="t", outcome="dispatched", authorized=True,
+        body="x" * 5000, author="", repo="", now=NOW,
+    )
+    row = client.puts[0]
+    assert len(row["body"]["S"]) == 1000  # clipped — the log is an index, not a transcript
+    assert "author" not in row and "repo" not in row  # empty strings are omitted, not stored

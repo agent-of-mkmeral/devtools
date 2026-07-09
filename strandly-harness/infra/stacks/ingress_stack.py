@@ -64,6 +64,17 @@ class IngressStack(Stack):
             ),
         )
 
+        # The mention-log table (also DataStack-owned, referenced by name): the poller writes one
+        # row per processed mention so the dashboard's Mentions tab can show who mentioned the
+        # agent and whether they were authorized. Write-only (PutItem) — the dashboard reads it.
+        mention_log_table = dynamodb.Table.from_table_attributes(
+            self,
+            "MentionLogRef",
+            table_arn=dynamodb_table_arn(
+                naming.mention_log_table, region=self.region, account=self.account
+            ),
+        )
+
         asset_path = Path(poller_asset) if poller_asset else _DEFAULT_ASSET
         if not asset_path.is_dir():
             raise FileNotFoundError(
@@ -77,6 +88,11 @@ class IngressStack(Stack):
             "STRANDLY_MENTION_HANDLE": mention_handle,
             "STRANDLY_MENTION_ALLOWED_AUTHORS": allowed_authors,
             "STRANDLY_DEDUP_TABLE": dedup_table.table_name,
+            # Gates + names the EMF metric namespace. Without it the poller's metrics.emit() is a
+            # no-op, so PollSuccess never lands and MonitoringStack's `poll-silent` alarm can never
+            # clear (it treats missing data as breaching). Must match the namespace the alarm reads.
+            "STRANDLY_METRICS_NAMESPACE": naming.metrics_namespace,
+            "STRANDLY_MENTION_LOG_TABLE": mention_log_table.table_name,
         }
         if skip_repo:
             env_vars["STRANDLY_MENTION_SKIP_REPO"] = skip_repo
@@ -109,6 +125,7 @@ class IngressStack(Stack):
         # Least privilege: RW the dedup table (incl. DeleteItem for intent rollback), invoke the one
         # runtime (+ its sessions), read the one secret. Logs come from the LogGroup grant below.
         dedup_table.grant(poller, "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem")
+        mention_log_table.grant(poller, "dynamodb:PutItem")
         poller.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["bedrock-agentcore:InvokeAgentRuntime"],

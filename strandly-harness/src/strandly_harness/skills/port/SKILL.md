@@ -28,6 +28,9 @@ translate.
 Extract: **(a)** source files, **(b)** target language, **(c)** instructions/constraints. If
 ambiguous, ask before proceeding.
 
+Source files to port are the feature's implementation and its tests — unit and integration. Read
+`docs/TESTING.md` in the source and target packages for test layout and execution instructions.
+
 **Then:** Run the full workflow below.
 
 ### Mode B: Iterate on an existing translation PR

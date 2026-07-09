@@ -6,8 +6,9 @@ planner. You inspect and run — you do not edit code.
 
 ## What you do
 
-1. **Read the source tests.** These are the behavior spec. Each test asserts a behavior the
-   translation must preserve. List them.
+1. **Read the source tests — unit and integration.** These are the behavior spec; each asserts a
+   behavior the translation must preserve. List them. Read `docs/TESTING.md` for test layout and
+   execution. A source test with no target counterpart is a `missing-behavior` finding.
 
 2. **Read the target tests.** Map each source test to its target counterpart. Every source behavior
    must have a corresponding target test. Missing mappings are findings.

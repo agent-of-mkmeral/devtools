@@ -30,6 +30,7 @@ _MIRRORED = {
     "KB_VECTOR_DIMENSION": constants.KB_VECTOR_DIMENSION,
     "KB_VECTOR_DISTANCE_METRIC": constants.KB_VECTOR_DISTANCE_METRIC,
     "RUN_LEDGER_GSI": constants.RUN_LEDGER_GSI_NAME,
+    "MENTION_LOG_GSI": constants.MENTION_LOG_GSI_NAME,
 }
 
 
@@ -72,6 +73,24 @@ def test_dashboard_handler_gsi_name_matches():
     assert found.get("GSI_NAME") == constants.RUN_LEDGER_GSI_NAME, (
         f"dashboard/api/handler.py GSI_NAME={found.get('GSI_NAME')!r} drifted from "
         f"constants.RUN_LEDGER_GSI_NAME={constants.RUN_LEDGER_GSI_NAME!r}."
+    )
+
+
+def test_dashboard_handler_mention_log_constants_match():
+    """The dashboard Lambda queries the mention-log GSI by the same name/partition the poller writes.
+
+    Fourth leg of the mirror for the Mentions tab: ``mention_log.record`` writes ``gsi_pk`` from
+    ``constants.MENTION_LOG_GSI_PK_VALUE`` and the Data stack names the index from ``common.py``'s
+    ``MENTION_LOG_GSI`` — a drift in the handler's copies silently empties the tab.
+    """
+    found = _module_constants(_HANDLER)
+    assert found.get("MENTION_LOG_GSI_NAME") == constants.MENTION_LOG_GSI_NAME, (
+        f"dashboard/api/handler.py MENTION_LOG_GSI_NAME={found.get('MENTION_LOG_GSI_NAME')!r} drifted "
+        f"from constants.MENTION_LOG_GSI_NAME={constants.MENTION_LOG_GSI_NAME!r}."
+    )
+    assert found.get("MENTION_LOG_GSI_PK_VALUE") == constants.MENTION_LOG_GSI_PK_VALUE, (
+        f"dashboard/api/handler.py MENTION_LOG_GSI_PK_VALUE={found.get('MENTION_LOG_GSI_PK_VALUE')!r} "
+        f"drifted from constants.MENTION_LOG_GSI_PK_VALUE={constants.MENTION_LOG_GSI_PK_VALUE!r}."
     )
 
 

@@ -658,3 +658,54 @@ def test_build_alarms_reader_gated_on_env(monkeypatch):
     reader = handler._build_alarms_reader()
     assert isinstance(reader, handler.AlarmsReader)
     assert reader._prefix == "strandly-dev-"
+
+
+# ---- mentions (poller-written mention log) ----------------------------------------------
+
+
+class FakeMentions:
+    def __init__(self, items):
+        self._items = items
+        self.recent_limit = None
+
+    def recent(self, limit):
+        self.recent_limit = limit
+        return self._items[:limit]
+
+
+_MENTION_ROWS = [
+    {"mention_id": "t1#2999-01-01T10:00:00Z#dispatched", "author": "mkmeral", "authorized": True,
+     "outcome": "dispatched", "repo": "ext/repo", "number": 42, "is_pull_request": True,
+     "seen_at": "2999-01-01T10:00:05+00:00"},
+    {"mention_id": "t2#2999-01-01T09:00:00Z#unauthorized", "author": "eve", "authorized": False,
+     "outcome": "unauthorized", "repo": "ext/repo", "number": 7, "is_pull_request": False,
+     "seen_at": "2999-01-01T09:00:05+00:00"},
+]
+
+
+def test_mentions_route_returns_rows_and_enabled():
+    m = FakeMentions(_MENTION_ROWS)
+    status, body = handler.route(_evt("/api/mentions"), FakeReader(SAMPLE), mentions=m)
+    assert status == 200 and body["enabled"] is True
+    assert [r["author"] for r in body["mentions"]] == ["mkmeral", "eve"]
+    assert body["mentions"][1]["authorized"] is False
+
+
+def test_mentions_route_clamps_limit():
+    m = FakeMentions(_MENTION_ROWS)
+    handler.route(_evt("/api/mentions", query={"limit": "9999"}), FakeReader(SAMPLE), mentions=m)
+    assert m.recent_limit == handler.RUNS_MAX_LIMIT
+
+
+def test_mentions_route_unconfigured_is_disabled_not_error():
+    # No mention-log table (older deploy) → the tab gets an explicit off signal, not a 500.
+    status, body = handler.route(_evt("/api/mentions"), FakeReader(SAMPLE))
+    assert status == 200
+    assert body == {"mentions": [], "enabled": False}
+
+
+def test_mentions_route_works_without_ledger_reader():
+    # Mentions read their own table — a missing run-ledger must not block them.
+    m = FakeMentions(_MENTION_ROWS)
+    status, body = handler.route(_evt("/api/mentions"), None, mentions=m)
+    assert status == 200 and body["enabled"] is True

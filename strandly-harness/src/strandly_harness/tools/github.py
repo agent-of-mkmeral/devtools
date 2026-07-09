@@ -29,6 +29,7 @@ seams tests monkeypatch, keeping the suite network-free.
 from __future__ import annotations
 
 import base64
+import fnmatch
 import json
 import logging
 import os
@@ -207,6 +208,36 @@ def extract_owner_from_variables(variables: dict[str, Any]) -> str | None:
     return None
 
 
+def extract_target_from_variables(variables: dict[str, Any]) -> str | None:
+    """The most specific target the variables name: ``owner/repo`` when both are present, else the
+    bare ``owner``, else ``None``.
+
+    The allow-list matcher needs the full ``owner/repo`` to honour a repo-scoped pattern like
+    ``aws/bedrock-agentcore-*``; a bare owner only satisfies a whole-org (bare-owner) allow entry.
+    Reuses :func:`extract_owner_from_variables` for the owner half and pairs it with the repo
+    ``name`` variable (or a ``repository`` string that already carries ``owner/repo``).
+
+    This is a best-effort target for the **explicit-variable** layer only — NOT the authoritative
+    write check. GraphQL write mutations route by **node id** (``repositoryId``/``subjectId``/…),
+    which is resolved to the real ``owner/repo`` and checked in ``validate_owner``'s node-id layer
+    *before* this. So even if ``name`` here is an overloaded/unrelated field (a label or branch
+    name rather than the repo) and synthesizes a wrong ``owner/repo``, it cannot authorize a write
+    to an unlisted repo: any node-id target is blocked on its true owner regardless. And when only
+    a bare owner can be derived, matching falls through to the bare owner — which fails **closed**
+    against a repo-glob-only org (the intended strictness).
+    """
+    repo = variables.get("repository")
+    if isinstance(repo, str) and "/" in repo:
+        return repo
+    owner = extract_owner_from_variables(variables)
+    if owner is None:
+        return None
+    name = variables.get("name") or variables.get("repositoryName") or variables.get("repo")
+    if isinstance(name, str) and name and "/" not in name:
+        return f"{owner}/{name}"
+    return owner
+
+
 def extract_node_ids_from_variables(variables: dict[str, Any]) -> list[str]:
     """Recursively collect GitHub node ids from variable values (flat or nested in dicts/lists).
 
@@ -280,7 +311,13 @@ query($id: ID!) {
 
 
 def resolve_node_owner(node_id: str, token: str) -> str | None:
-    """Resolve a node id to its repo owner, or None if it can't be resolved."""
+    """Resolve a node id to its repo target, or None if it can't be resolved.
+
+    Returns the full ``owner/repo`` (``nameWithOwner``) — NOT just the owner — so the allow-list can
+    match repo-scoped patterns like ``aws/bedrock-agentcore-*`` as well as bare owners. The matcher
+    (:func:`_target_allowed`) accepts either form, so a bare-owner allow entry still grants the whole
+    org. (Historically this returned only the owner; the extra repo half is additive.)
+    """
     try:
         data = _graphql(_RESOLVE_QUERY, {"id": node_id}, token)
     except Exception as e:  # noqa: BLE001 — resolution failure is non-fatal (caller decides)
@@ -305,8 +342,35 @@ def resolve_node_owner(node_id: str, token: str) -> str | None:
     if not name_with_owner:
         name_with_owner = node.get("nameWithOwner")
     if isinstance(name_with_owner, str) and "/" in name_with_owner:
-        return name_with_owner.split("/")[0]
+        return name_with_owner
     return None
+
+
+def _target_allowed(target: str, allowed_owners: set[str]) -> bool:
+    """True iff ``target`` is permitted by ``allowed_owners``. Case-insensitive.
+
+    ``target`` is either a bare ``owner`` or a full ``owner/repo``. An allow entry is either:
+
+    - **a bare owner** (no ``/``, e.g. ``strands-agents``) — matches any repo under that owner
+      (whole-org grant), by comparing the target's owner half; or
+    - **a repo glob** (contains ``/``, e.g. ``aws/bedrock-agentcore-*``) — matched with ``fnmatch``
+      against the FULL ``owner/repo``, so it only ever grants specific repos.
+
+    A repo glob can therefore match only when the repo half is known: an owner-only target (repo
+    couldn't be determined) can satisfy a bare-owner entry but NEVER a repo glob — which is the
+    fail-closed behavior we want (an unverifiable repo under an org we only allow specific repos of
+    is denied). GitHub owner/repo names can't contain glob metacharacters, so patterns are safe.
+    """
+    t = target.lower()
+    t_owner = t.split("/", 1)[0]
+    for entry in allowed_owners:
+        e = entry.lower()
+        if "/" in e:
+            if "/" in t and fnmatch.fnmatchcase(t, e):
+                return True
+        elif t_owner == e:
+            return True
+    return False
 
 
 def validate_owner(
@@ -335,12 +399,12 @@ def validate_owner(
     allowed, so user-/schema-scoped mutations are not over-blocked.
     """
     explicit = extract_owner_from_variables(variables)
+    explicit_target = extract_target_from_variables(variables)
 
     # Guardrail off: no allow-list configured.
     if not allowed_owners:
         return None, explicit
 
-    allowed_lower = {o.lower() for o in allowed_owners}
     allowed_str = ", ".join(sorted(allowed_owners))
 
     # Collect every node-id target the mutation names — from the variables AND inlined in the
@@ -359,6 +423,9 @@ def validate_owner(
     # ``owner`` var — so neither a decoy allowed ``owner`` var NOR a decoy sibling node that *does*
     # resolve to an allowed owner can shadow an external/unresolvable node id. Build a per-node
     # resolution map; any node id resolving to an owner outside the allow-list blocks immediately.
+    # ``resolve_node_owner`` returns the full ``owner/repo`` (or None). Match it against the
+    # allow-list with ``_target_allowed`` so a repo pattern (``aws/bedrock-agentcore-*``) is honoured
+    # and a bare-owner entry still matches on the owner half.
     resolve_map: dict[str, str | None] = {}
     resolved_owner: str | None = None
     if node_ids and token:
@@ -367,9 +434,9 @@ def validate_owner(
             resolve_map[node_id] = resolved
             if resolved is None:
                 continue
-            if resolved.lower() not in allowed_lower:
+            if not _target_allowed(resolved, allowed_owners):
                 return (
-                    f"Blocked: node id '{node_id}' belongs to owner '{resolved}', "
+                    f"Blocked: node id '{node_id}' belongs to '{resolved}', "
                     f"not in the allowed list ({allowed_str})."
                 ), None
             resolved_owner = resolved
@@ -393,11 +460,15 @@ def validate_owner(
                 f"owner. Use explicit owner/name variables instead."
             ), None
 
-    # Layer 1: explicit owner variable.
-    if explicit is not None:
-        if explicit.lower() not in allowed_lower:
+    # Layer 1: explicit owner/repo from the variables. Match the most specific target we can build
+    # (``owner/repo`` when the repo name is present, else the bare owner). Fail-closed: if the
+    # allow-list only permits *specific repos* of this owner (all matching entries are repo globs)
+    # and the mutation named only the owner, ``_target_allowed`` returns False on the bare owner and
+    # the call is blocked — we won't grant a whole owner we only allow-listed repos of.
+    if explicit_target is not None:
+        if not _target_allowed(explicit_target, allowed_owners):
             return (
-                f"Blocked: target owner '{explicit}' is not in the allowed list ({allowed_str})."
+                f"Blocked: target '{explicit_target}' is not in the allowed list ({allowed_str})."
             ), None
         return None, resolved_owner or explicit
 
@@ -476,8 +547,15 @@ def enforce_throttle(
     """Gate a write. ``(allowed, message)``; internal targets and API failures never block."""
     if not gh.throttle_enabled:
         return True, "throttle disabled"
-    internal = {o.lower() for o in gh.internal_owners}
-    if target_owner and target_owner.lower() in internal:
+    # Internal exemption matches on the OWNER HALF against BARE-OWNER entries only:
+    # - ``target_owner`` may now be a full ``owner/repo`` (resolve_node_owner returns
+    #   nameWithOwner since repo-scoped allow entries landed), so compare its owner half.
+    # - ``internal_owners`` mirrors ``allowed_owners`` and can therefore contain repo-glob /
+    #   literal-repo entries (``aws/bedrock-agentcore-*``) — those grant WRITES to specific
+    #   external repos and must NOT exempt them from the external-write throttle, so entries
+    #   with a ``/`` are excluded from the exemption set.
+    internal = {o.lower() for o in gh.internal_owners if "/" not in o}
+    if target_owner and target_owner.split("/", 1)[0].lower() in internal:
         return True, "internal target — not throttled"
 
     now = time.time()
@@ -533,7 +611,15 @@ def _rest_get(path: str, token: str | None = None) -> Any:
 
 
 def _get_token(gh: GitHubSettings, use_pat_token: bool) -> str | None:
-    """First non-empty token from the configured env var names (PAT first if requested)."""
+    """First non-empty token: the config-resolved token, else the env var names (PAT first if asked).
+
+    ``gh.token`` is resolved from the loaded ``Config`` (Secrets Manager / .env merged under the
+    env), so it works on the deployed runtime where the token lives only in the secret and never
+    reaches ``os.environ``. The ``os.environ`` scan remains the fallback for local / GitHub-Actions
+    runs, and honours ``use_pat_token`` (PAT-first) which the single config token can't express.
+    """
+    if gh.token:
+        return gh.token
     names = list(gh.token_env)
     if use_pat_token and "PAT_TOKEN" in names:
         names.remove("PAT_TOKEN")

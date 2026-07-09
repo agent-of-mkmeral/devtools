@@ -600,3 +600,25 @@ def test_tool_benign_base64_not_overblocked(github_tool):
     assert result["status"] == "error"
     # Reached _graphql (our _no_network sentinel) rather than being guardrail-blocked → no over-block.
     assert "network reached" in result["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# _get_token: config-resolved token (secret) vs os.environ fallback
+# ---------------------------------------------------------------------------
+def test_get_token_prefers_config_resolved_token(monkeypatch):
+    # Regression (prod): on the deployed runtime the token lives ONLY in the config secret and never
+    # reaches os.environ, so use_github must read the token GitHubSettings carries from the loaded
+    # Config. With no token env vars set, the config token must still be used.
+    for name in ("STRANDLY_GITHUB_TOKEN", "GITHUB_TOKEN", "PAT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    settings = GitHubSettings(token="ghp_fromsecret")
+    assert gh._get_token(settings, use_pat_token=False) == "ghp_fromsecret"
+
+
+def test_get_token_falls_back_to_environ_when_no_config_token(monkeypatch):
+    # Local / GitHub-Actions: no config token → scan the env var names (the original behavior).
+    for name in ("STRANDLY_GITHUB_TOKEN", "GITHUB_TOKEN", "PAT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_fromenv")
+    settings = GitHubSettings()  # token=None
+    assert gh._get_token(settings, use_pat_token=False) == "ghp_fromenv"

@@ -16,9 +16,10 @@ These apply regardless of the language pair:
    you're uncertain whether an idiom changes behavior, fall back to a literal translation and flag
    it in the decision log.
 
-3. **The source tests are the behavioral spec.** Each source test asserts a behavior. Every asserted
-   behavior must have a corresponding target test. The tests define what "correct" means — not the
-   implementation structure.
+3. **The source tests are the behavioral spec.** Each source test — unit and integration — asserts a
+   behavior; every one must have a corresponding target test, or it is a `missing-behavior` finding.
+   The tests define what "correct" means, not the implementation structure. Read `docs/TESTING.md`
+   for test layout and execution (see [Discovering project conventions](#discovering-project-conventions)).
 
 4. **One feature, nothing else.** Do not touch code outside the feature scope. If you discover
    pre-existing issues in the target codebase, flag them — don't fix them.
@@ -134,7 +135,11 @@ These apply regardless of the language pair:
 ## Discovering project conventions
 
 When translating into a target language, the subagents should inspect the target codebase for
-conventions rather than assuming them. Key things to discover:
+conventions rather than assuming them.
+
+Each package's own docs are authoritative for language-specific conventions. Read `docs/PORTING.md`
+(construct mappings) and `docs/TESTING.md` (test layout and execution) in the source and target
+packages; this file holds only the cross-language rules. Then inspect the codebase to fill gaps:
 
 1. **Directory layout** — where does source code live vs. tests? (`src/` vs flat? `tests/`
    mirroring `src/`?)

@@ -151,3 +151,136 @@ def test_use_github_bare_cr_targetless_read_not_overblocked(monkeypatch, gh_sett
     res = use_github(query_type="query", query=q, variables={}, label="benign-read")
     assert res["status"] == "success"
     assert len(calls) == 1  # the read executed, not over-blocked
+
+
+# ---------------------------------------------------------------------------
+# Repo-glob allow entries (owner/repo patterns) — let specific external repos through
+# (e.g. the AgentCore packages) WITHOUT opening a whole org, while bare-owner entries still
+# grant the whole org. Matcher: strandly_harness.tools.github._target_allowed.
+# ---------------------------------------------------------------------------
+from strandly_harness.tools.github import _target_allowed  # noqa: E402
+
+_MIXED = {"strands-agents", "strands-labs", "aws/bedrock-agentcore-*", "aws/agentcore-cli"}
+
+
+def test_target_allowed_bare_owner_grants_whole_org():
+    assert _target_allowed("strands-agents", _MIXED)
+    assert _target_allowed("strands-agents/sdk-python", _MIXED)  # any repo under a bare owner
+    assert _target_allowed("STRANDS-AGENTS/Foo", _MIXED)  # case-insensitive
+
+
+def test_target_allowed_repo_glob_matches_only_specific_repos():
+    assert _target_allowed("aws/bedrock-agentcore-sdk-python", _MIXED)
+    assert _target_allowed("aws/bedrock-agentcore-sdk-typescript", _MIXED)
+    assert _target_allowed("aws/bedrock-agentcore-starter-toolkit", _MIXED)
+    assert _target_allowed("aws/agentcore-cli", _MIXED)
+    # A different aws repo NOT matching the glob is denied — the org is not wholesale-allowed.
+    assert not _target_allowed("aws/aws-cli", _MIXED)
+    assert not _target_allowed("aws/some-other-repo", _MIXED)
+
+
+def test_target_allowed_bare_owner_never_satisfies_a_repo_glob_only_org():
+    # 'aws' appears ONLY as repo globs, never as a bare owner → a bare 'aws' target (repo unknown)
+    # must be DENIED (fail-closed). This is the strict/unverifiable-repo case.
+    assert not _target_allowed("aws", _MIXED)
+
+
+def test_target_allowed_glob_does_not_leak_across_owner():
+    # The glob is anchored to its owner: a lookalike owner must not match.
+    assert not _target_allowed("notaws/bedrock-agentcore-sdk-python", _MIXED)
+    # And a repo that merely starts like the pattern under the wrong owner is denied.
+    assert not _target_allowed("evil/bedrock-agentcore-x", _MIXED)
+
+
+def test_validate_owner_glob_allows_agentcore_node_id(monkeypatch):
+    # A comment mutation whose node id resolves to an AgentCore repo is allowed by the glob.
+    monkeypatch.setattr(
+        gh_tool, "resolve_node_owner", lambda nid, tok: "aws/bedrock-agentcore-sdk-typescript"
+    )
+    err, resolved = validate_owner(
+        {"subjectId": "IC_kwDOagentcore123"},
+        allowed_owners=_MIXED, is_mutative=True, strict=True, token="t",
+    )
+    assert err is None
+    assert resolved == "aws/bedrock-agentcore-sdk-typescript"
+
+
+def test_validate_owner_glob_blocks_other_aws_repo_node_id(monkeypatch):
+    # A node id resolving to a non-matching aws repo is blocked — the org isn't wholesale-allowed.
+    monkeypatch.setattr(gh_tool, "resolve_node_owner", lambda nid, tok: "aws/aws-cli")
+    err, _ = validate_owner(
+        {"subjectId": "IC_kwDOawscli999"},
+        allowed_owners=_MIXED, is_mutative=True, strict=True, token="t",
+    )
+    assert err is not None and "aws/aws-cli" in err
+
+
+def test_validate_owner_glob_blocks_owner_only_target_failclosed():
+    # A mutation naming only owner='aws' (no repo) can't be verified against a repo-glob-only org →
+    # blocked (fail-closed), the behavior we want for unverifiable external targets.
+    err, _ = validate_owner(
+        {"owner": "aws"}, allowed_owners=_MIXED, is_mutative=True, strict=True, token=None,
+    )
+    assert err is not None and "not in the allowed list" in err
+
+
+def test_validate_owner_glob_allows_explicit_owner_and_name(monkeypatch):
+    # owner + name variables build owner/repo, which the glob matches — no network needed.
+    err, resolved = validate_owner(
+        {"owner": "aws", "name": "bedrock-agentcore-sdk-python"},
+        allowed_owners=_MIXED, is_mutative=True, strict=True, token="t",
+    )
+    assert err is None
+
+
+# ---------------------------------------------------------------------------
+# Throttle × repo-scoped targets: resolve_node_owner now returns full owner/repo, and
+# internal_owners (mirroring allowed_owners) can contain repo-glob entries. The internal
+# exemption must (a) still recognize an internal target resolved to owner/repo, and (b) NOT
+# exempt external repos that are merely write-allowed via a repo glob / literal repo entry.
+# ---------------------------------------------------------------------------
+from strandly_harness.core.config import GitHubSettings  # noqa: E402
+from strandly_harness.tools.github import enforce_throttle  # noqa: E402
+
+_GH_THROTTLED = GitHubSettings(
+    allowed_owners=("strands-agents", "aws/bedrock-agentcore-*", "aws/agentcore-cli"),
+    internal_owners=("strands-agents", "aws/bedrock-agentcore-*", "aws/agentcore-cli"),
+    throttle_enabled=True,
+    throttle_limit=50,
+)
+
+
+@pytest.fixture
+def _throttle_at_limit(monkeypatch):
+    """Prime the throttle cache at the limit so any non-internal target is blocked."""
+    gh_tool.invalidate_throttle_cache()
+    monkeypatch.setitem(gh_tool._throttle_cache, "value", 50)
+    monkeypatch.setitem(gh_tool._throttle_cache, "ts", __import__("time").time())
+    yield
+    gh_tool.invalidate_throttle_cache()
+
+
+def test_throttle_internal_target_resolved_to_owner_repo_is_exempt(_throttle_at_limit):
+    # resolve_node_owner returns 'owner/repo' now — an internal write routed by node id must
+    # still be exempt from the external-write throttle (regression: exact-match on the full
+    # string treated it as external and blocked it at the limit).
+    allowed, msg = enforce_throttle("strands-agents/sdk-python", gh=_GH_THROTTLED, token="t")
+    assert allowed
+    assert "internal" in msg
+
+
+def test_throttle_bare_internal_owner_still_exempt(_throttle_at_limit):
+    allowed, _ = enforce_throttle("strands-agents", gh=_GH_THROTTLED, token="t")
+    assert allowed
+
+
+def test_throttle_glob_allowed_external_repo_is_NOT_exempt(_throttle_at_limit):
+    # A repo allowed for writes via a glob (or a literal owner/repo entry) is still EXTERNAL:
+    # it must be throttled, not exempted by the internal_owners mirror containing the entry.
+    allowed, msg = enforce_throttle(
+        "aws/bedrock-agentcore-sdk-python", gh=_GH_THROTTLED, token="t"
+    )
+    assert not allowed and "throttle reached" in msg
+    # Even an exact-string internal entry like 'aws/agentcore-cli' must not exempt itself.
+    allowed, msg = enforce_throttle("aws/agentcore-cli", gh=_GH_THROTTLED, token="t")
+    assert not allowed and "throttle reached" in msg

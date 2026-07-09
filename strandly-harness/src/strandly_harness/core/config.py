@@ -67,6 +67,7 @@ MENTION_ALLOWED_AUTHORS = "STRANDLY_MENTION_ALLOWED_AUTHORS"  # comma-separated 
 MENTION_ALLOWED_ORGS = "STRANDLY_MENTION_ALLOWED_ORGS"  # comma-separated orgs whose members may invoke
 MENTION_SKIP_REPO = "STRANDLY_MENTION_SKIP_REPO"  # own repo to skip (handled by direct events)
 DEDUP_TABLE = "STRANDLY_DEDUP_TABLE"  # DynamoDB table name for the durable dispatch backstop
+MENTION_LOG_TABLE = "STRANDLY_MENTION_LOG_TABLE"  # DynamoDB table logging every processed mention (dashboard)
 RUNTIME_ARN = "STRANDLY_RUNTIME_ARN"  # deployed runtime ARN the poller dispatches to (fire-and-forget)
 
 # Independent GitHub write-audit (ops/lambdas/mention_poller/audit.py): an out-of-band scheduled job that asks
@@ -90,6 +91,11 @@ class GitHubSettings:
     # The token env var(s) checked, in order. Strandly's token is STRANDLY_GITHUB_TOKEN; the
     # legacy names are kept as fallbacks so a stock GITHUB_TOKEN also works locally.
     token_env: tuple[str, ...] = ("STRANDLY_GITHUB_TOKEN", "GITHUB_TOKEN", "PAT_TOKEN")
+    # The token resolved from the loaded Config (which merges Secrets Manager / .env under the
+    # process env). Carried here so `use_github` can authenticate when the token lives ONLY in the
+    # secret and never reaches os.environ — the deployed-runtime case (STRANDLY_SECRETS_ARN). None
+    # falls back to reading token_env from os.environ (local / GitHub-Actions).
+    token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ class MentionPollerSettings:
     runtime_arn: str | None = None
     region: str | None = None
     dedup_table: str | None = None
+    mention_log_table: str | None = None
 
     def is_authorized(self, author: str | None) -> bool:
         """True iff ``author`` is a known, non-empty login in the allow-list (case-insensitive).
@@ -153,13 +160,23 @@ class Config:
         non-empty comma-separated list, which overrides it. ``internal_owners`` mirrors the same
         resolved tuple, and ``strict_mutations`` stays on so unverifiable mutation targets are
         blocked rather than silently allowed.
+
+        Each entry is either a **bare owner** (``strands-agents`` — grants the whole org) or a
+        **repo glob** (``aws/bedrock-agentcore-*`` — grants only matching ``owner/repo``); the tool's
+        ``_target_allowed`` matcher honours both. This is how a deployment can let Strandly write to
+        specific external repos (e.g. the AgentCore SDK/CLI packages) without opening a whole org —
+        e.g. ``STRANDLY_ALLOWED_OWNERS=strands-agents,strands-labs,aws/bedrock-agentcore-*,aws/agentcore-cli``.
         """
         from strandly_harness.core.constants import STRANDS_ORG_OWNERS
 
         raw_owners = self.get(ALLOWED_OWNERS) or ""
         parsed = tuple(o.strip() for o in raw_owners.split(",") if o.strip())
         owners = parsed or STRANDS_ORG_OWNERS
-        return GitHubSettings(allowed_owners=owners, internal_owners=owners)
+        # Resolve the token from the loaded config (Secrets Manager / .env merged under the env), in
+        # token_env order, so the deployed runtime — where the token lives only in the secret and
+        # never reaches os.environ — can authenticate. None ⇒ the tool falls back to os.environ.
+        token = next((self.get(name) for name in GitHubSettings.token_env if self.get(name)), None)
+        return GitHubSettings(allowed_owners=owners, internal_owners=owners, token=token)
 
     # ---- loading -------------------------------------------------------------------
 
@@ -198,6 +215,22 @@ class Config:
     @property
     def github_enabled(self) -> bool:
         return bool(self.get(GITHUB_TOKEN))
+
+    @property
+    def github_token(self) -> str | None:
+        """The GitHub token itself — first non-empty of the ``use_github`` tool's env-var order.
+
+        Same precedence as the tool (``GitHubSettings.token_env``: ``STRANDLY_GITHUB_TOKEN``,
+        then the legacy ``GITHUB_TOKEN`` / ``PAT_TOKEN``), but resolved through :meth:`get` so a
+        Secrets-Manager-only deployment (no process env var) also finds it. Used to bootstrap the
+        sandbox's git credentials, so native ``git clone``/``push`` inside the sandbox authenticates
+        as the same identity as the tool's API writes.
+        """
+        for name in self.github.token_env:
+            value = self.get(name)
+            if value:
+                return value
+        return None
 
     @property
     def search_mcp_url(self) -> str | None:
@@ -285,6 +318,7 @@ class Config:
             runtime_arn=self.runtime_arn,
             region=self.aws_region,
             dedup_table=self.get(DEDUP_TABLE),
+            mention_log_table=self.get(MENTION_LOG_TABLE),
         )
 
     # ---- run ledger --------------------------------------------------
@@ -359,10 +393,26 @@ class Config:
         return bool(s.allowed_owners and s.token)
 
 
+def _region_from_secret_arn(arn: str) -> str | None:
+    """The region embedded in a secret ARN (``arn:aws:secretsmanager:<region>:...``), or None.
+
+    A full secret ARN always carries its region in the 4th ``:``-delimited field. Falling back to it
+    means the secret still loads even when neither ``AWS_REGION`` nor a boto default region is set —
+    e.g. the AgentCore runtime container, whose process env has no ``AWS_REGION``, where relying on
+    the passed-in region would raise ``NoRegionError`` and silently leave the config (and thus the
+    GitHub token) empty.
+    """
+    parts = arn.split(":")
+    return parts[3] if len(parts) > 4 and parts[3] else None
+
+
 def _load_secret(arn: str, region: str | None) -> dict[str, str]:
     """Fetch a Secrets Manager secret (a JSON object) and return it as a flat str dict."""
     import boto3
 
+    # Prefer the caller's region, but fall back to the region baked into the ARN so the fetch works
+    # even when the process has no AWS_REGION (the runtime container) — otherwise NoRegionError.
+    region = region or _region_from_secret_arn(arn)
     client = boto3.Session(region_name=region).client("secretsmanager")
     resp = client.get_secret_value(SecretId=arn)
     raw = resp.get("SecretString") or "{}"

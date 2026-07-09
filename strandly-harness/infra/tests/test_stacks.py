@@ -20,7 +20,7 @@ from aws_cdk.assertions import Match, Template
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stacks.backend_stack import BackendStack  # noqa: E402
-from stacks.common import RUN_LEDGER_GSI, Naming  # noqa: E402
+from stacks.common import MENTION_LOG_GSI, RUN_LEDGER_GSI, Naming  # noqa: E402
 from stacks.dashboard_stack import DashboardStack  # noqa: E402
 from stacks.data_stack import DataStack  # noqa: E402
 from stacks.ingress_stack import IngressStack  # noqa: E402
@@ -38,11 +38,11 @@ def _naming(env: str = "dev") -> Naming:
 
 # ---- Data ------------------------------------------------------------------------------
 
-def test_data_stack_two_tables_and_recent_gsi():
+def test_data_stack_three_tables_and_recent_gsis():
     app = cdk.App()
     stack = DataStack(app, "Strandly-Data-dev", naming=_naming(), env=_ENV)
     t = Template.from_stack(stack)
-    t.resource_count_is("AWS::DynamoDB::Table", 2)
+    t.resource_count_is("AWS::DynamoDB::Table", 3)
     # The run-ledger carries the "recent" GSI the dashboard queries.
     t.has_resource_properties(
         "AWS::DynamoDB::Table",
@@ -50,6 +50,27 @@ def test_data_stack_two_tables_and_recent_gsi():
             "GlobalSecondaryIndexes": Match.array_with(
                 [Match.object_like({"IndexName": RUN_LEDGER_GSI})]
             )
+        },
+    )
+    # The mention log (Mentions tab) has the same newest-first GSI shape, keyed on seen_at, + TTL.
+    t.has_resource_properties(
+        "AWS::DynamoDB::Table",
+        {
+            "TableName": "strandly-dev-mentionlog",
+            "TimeToLiveSpecification": Match.object_like({"AttributeName": "ttl", "Enabled": True}),
+            "GlobalSecondaryIndexes": Match.array_with(
+                [
+                    Match.object_like(
+                        {
+                            "IndexName": MENTION_LOG_GSI,
+                            "KeySchema": [
+                                {"AttributeName": "gsi_pk", "KeyType": "HASH"},
+                                {"AttributeName": "seen_at", "KeyType": "RANGE"},
+                            ],
+                        }
+                    )
+                ]
+            ),
         },
     )
 
@@ -220,10 +241,35 @@ def test_ingress_stack_lambda_schedule_and_scoped_invoke(tmp_path):
     t = Template.from_stack(stack)
     t.resource_count_is("AWS::Lambda::Function", 1)
     t.resource_count_is("AWS::Scheduler::Schedule", 1)
+    # The poller MUST get the metric namespace, or metrics.emit() is a no-op → PollSuccess never
+    # lands → MonitoringStack's poll-silent alarm can never clear. Regression guard for that prod
+    # bug. Must equal naming.metrics_namespace (what the alarm reads).
+    t.has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Environment": {
+                "Variables": Match.object_like(
+                    {"STRANDLY_METRICS_NAMESPACE": _naming().metrics_namespace}
+                )
+            }
+        },
+    )
     # The dedup table is referenced by deterministic name, NOT a cross-stack import (no deadlock).
     assert "Fn::ImportValue" not in str(t.to_json())
     # ...but the poller's grant still targets the dedup table ARN.
     assert "table/strandly-dev-dedup" in str(t.to_json())
+    # Same by-name pattern for the mention log: env var wired, write grant present.
+    assert "table/strandly-dev-mentionlog" in str(t.to_json())
+    t.has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Environment": {
+                "Variables": Match.object_like(
+                    {"STRANDLY_MENTION_LOG_TABLE": "strandly-dev-mentionlog"}
+                )
+            }
+        },
+    )
     # The poller may invoke ONLY the one runtime (+ its sessions), not "*".
     t.has_resource_properties(
         "AWS::IAM::Policy",
@@ -265,6 +311,50 @@ def test_runtime_iam_grants_kb_and_ledger_when_given():
     assert "knowledge-base/KB123" in body
     assert "strandly-dev-runledger" in body
     assert "dynamodb:PutItem" in body
+
+
+def test_runtime_iam_grants_config_secret_read_when_given():
+    # With a config secret ARN, the exec role gets GetSecretValue on exactly that secret — so the
+    # runtime can Config.load from Secrets Manager and token rotation needs no runtime redeploy.
+    secret_arn = "arn:aws:secretsmanager:us-west-2:111111111111:secret:strandly/dev/config-abc123"
+    app = cdk.App()
+    stack = RuntimeIamStack(
+        app,
+        "Strandly-RuntimeIam-dev",
+        naming=_naming(),
+        exec_role_name="some-exec-role",
+        config_secret_arn=secret_arn,
+        env=_ENV,
+    )
+    t = Template.from_stack(stack)
+    t.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": Match.object_like(
+                {
+                    "Statement": Match.array_with(
+                        [
+                            Match.object_like(
+                                {
+                                    "Action": "secretsmanager:GetSecretValue",
+                                    "Resource": secret_arn,
+                                }
+                            )
+                        ]
+                    )
+                }
+            )
+        },
+    )
+
+
+def test_runtime_iam_no_secret_grant_without_arn():
+    # No secret ARN → no Secrets Manager grant at all (opt-in, least privilege).
+    app = cdk.App()
+    stack = RuntimeIamStack(
+        app, "Strandly-RuntimeIam-dev", naming=_naming(), exec_role_name="r", env=_ENV
+    )
+    assert "secretsmanager:GetSecretValue" not in str(Template.from_stack(stack).to_json())
 
 
 # ---- Dashboard -------------------------------------------------------------------------
@@ -364,6 +454,35 @@ def test_dashboard_no_invoke_grant_without_runtime():
     t = _dashboard(None)
     # Chat off: no InvokeAgentRuntime grant anywhere when no runtime arn is supplied.
     assert "bedrock-agentcore:InvokeAgentRuntime" not in str(t.to_json())
+
+
+def test_dashboard_describe_alarms_grant_is_unscoped():
+    # cloudwatch:DescribeAlarms is a list-style action that does NOT support resource-level
+    # permissions — scoping it to an alarm ARN yields AccessDenied at runtime (the health strip's
+    # "alarm read failed"). The IAM resource must be "*"; result-scoping is done by the handler's
+    # AlarmNamePrefix. Regression guard for that prod bug.
+    t = _dashboard(_RUNTIME_ARN)
+    t.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": Match.object_like(
+                {
+                    "Statement": Match.array_with(
+                        [
+                            Match.object_like(
+                                {
+                                    "Action": "cloudwatch:DescribeAlarms",
+                                    "Resource": "*",
+                                }
+                            )
+                        ]
+                    )
+                }
+            )
+        },
+    )
+    # And the prefix that scopes the *results* is wired into the Lambda env.
+    assert "strandly-dev-" in str(t.to_json())
 
 
 def test_dashboard_grants_scoped_log_read_when_runtime_given():

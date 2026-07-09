@@ -22,9 +22,9 @@ strandly run "..."                    # one-shot; also: chat | serve {agentcore,
 Dependencies are uv-managed: `pyproject.toml` is the single source of truth and `uv.lock` is
 the tool-managed freeze (**never hand-edit uv.lock**). After a dep change run `uv lock` (or
 `uv lock --upgrade-package <name>` to bump one dep); install with `uv sync --locked`, which
-hard-fails if the lock is stale. CI/deploy pipelines should install the same way and regenerate
-`requirements.txt` from the lock (`uv export`) so the AgentCore image builds from exact pinned
-versions.
+hard-fails if the lock is stale. CI + deploy install the same way, and the deploy workflow
+regenerates `requirements.txt` from the lock (`uv export`) so the AgentCore image builds from
+exact pinned versions.
 
 Importing the package runs `otel.sanitize_otel_env()` (strips a stray `xray` from
 `OTEL_PROPAGATORS` that would crash the OpenTelemetry import) — so no env var needs to be set, in
@@ -44,7 +44,7 @@ under the process env). Capabilities are **gated on their secret**:
 
 | Secret / env | Effect |
 |---|---|
-| `STRANDLY_GITHUB_TOKEN` | enables `use_github`; unlocks full GraphQL enrichment in the (always-on) `GitHubContextInjector` plugin |
+| `STRANDLY_GITHUB_TOKEN` | enables `use_github`; unlocks full GraphQL enrichment in the (always-on) `GitHubContextInjector` plugin; bootstraps the sandbox git client (credential store) so native `git clone`/`push` authenticates as the same identity |
 | `STRANDLY_SEARCH_MCP_URL` (+ `STRANDLY_SEARCH_MCP_TOKEN`) | adds the web-search MCP |
 | `AGENTCORE_CODE_INTERPRETER_ID` | use the managed sandbox (else local) |
 | `AGENTCORE_MEMORY_ID` | use the AgentCore short-term session (else file) |

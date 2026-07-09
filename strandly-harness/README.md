@@ -73,6 +73,11 @@ eval "$(strandly provision --name strandly --region us-west-2)"
 
 The CDK app under [`infra/`](./infra/) provisions the full deployed footprint (data, backend, ingress, monitoring, dashboard, OIDC federation for GitHub Actions).
 
+Two repo workflows drive the deployed agent keylessly via that OIDC federation (see [`.github/workflows/`](../.github/workflows/)):
+
+- **`strandly-deploy.yml`** — provisions + deploys the AgentCore runtime when `strandly-harness/` changes on `main` (and on manual dispatch), using the privileged *deploy* role.
+- **`strandly-invoke.yml`** — invokes the *deployed* runtime with a prompt (manual dispatch, reusable `workflow_call`, or a maintainer `@strandly` mention on an issue/PR), using the minimal *invoke* role that can never redeploy.
+
 ## Package Layout
 
 | Path | What it is |

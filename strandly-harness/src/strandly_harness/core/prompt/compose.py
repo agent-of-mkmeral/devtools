@@ -110,6 +110,32 @@ _CAPABILITY_BLOCKS: list[tuple[str, str]] = [
 ]
 
 
+# Guidance for the ephemeral (AgentCore) sandbox: its filesystem does NOT survive across separate
+# invocations of the same session, so long/multi-invoke work must persist its state OUT of the
+# sandbox. Emitted only when the sandbox is the non-local AgentCore one (the local sandbox is the
+# user's real disk, which persists). Applies to ALL work, not any one skill.
+_EPHEMERAL_SANDBOX_BLOCK = (
+    "## Your sandbox is ephemeral\n"
+    "Your shell and files run in a sandbox whose **filesystem does not persist across separate "
+    "invocations**. Within a single run it's stable — clone, edit, build, and test freely. But a "
+    "*later* invocation on the same task (a follow-up mention, a scheduled re-check, a resumed "
+    "job) may land on a **fresh, empty sandbox**: your clones, branches, uncommitted edits, and "
+    "installed tools will be gone, even though your conversation memory persists. Plan for that:\n"
+    "- **Persist real work in durable stores, not the sandbox.** Push code to a branch on the "
+    "remote (you have native git), post findings/decisions to the GitHub thread, and record "
+    "durable facts in long-term memory. The sandbox is scratch space, never the system of record.\n"
+    "- **Commit and push before you finish, not just at the very end.** For anything spanning more "
+    "than a few steps, push a WIP branch as you go so partial progress survives — a run cut short "
+    "(timeout, transient error, instance recycle) then resumes from the remote instead of redoing "
+    "the work. Use a stable, task-derived branch name so a later invocation finds and continues it.\n"
+    "- **On resume, reconcile before redoing.** If memory says you already started but the sandbox "
+    "is empty, first check the remote (does your WIP branch exist? what's on it?) and continue from "
+    "there — re-clone your own branch — rather than starting the task over from scratch.\n"
+    "- **Never assume a file, clone, or install from an earlier turn is still there** — verify, and "
+    "re-create it if not."
+)
+
+
 def global_prompt() -> str:
     """The shared global prompt prepended to every agent + subagent."""
     return _GLOBAL_PROMPT_PATH.read_text().strip()
@@ -124,19 +150,30 @@ def _capabilities_section(tool_names: Iterable[str]) -> str:
     return "## Capabilities\n" + "\n".join(f"- {b}" for b in blocks)
 
 
-def compose(system_prompt: str = "", tool_names: Iterable[str] | None = None) -> str:
+def compose(
+    system_prompt: str = "",
+    tool_names: Iterable[str] | None = None,
+    *,
+    ephemeral_sandbox: bool = False,
+) -> str:
     """Compose the full system prompt: global prompt, a dynamic capabilities block, then a layer.
 
     Args:
         system_prompt: Optional role layer placed on top of the global prompt (subagents pass it).
         tool_names: The agent's actual tool names; the capabilities section is built from these so
             the prompt only describes tools the agent really has. ``None`` omits the section.
+        ephemeral_sandbox: True when the sandbox is the non-local (AgentCore) one, whose filesystem
+            doesn't persist across separate invocations. Adds the ephemeral-sandbox guidance so the
+            agent persists work out of the sandbox — applies to all work, not any one skill. Omitted
+            for the local sandbox (the user's real disk, which persists).
     """
     parts = [global_prompt()]
     if tool_names is not None:
         caps = _capabilities_section(tool_names)
         if caps:
             parts.append(caps)
+    if ephemeral_sandbox:
+        parts.append(_EPHEMERAL_SANDBOX_BLOCK)
     if system_prompt and system_prompt.strip():
         parts.append(system_prompt.strip())
     return "\n\n".join(parts)

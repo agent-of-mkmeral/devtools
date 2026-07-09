@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from strandly_harness.core.config import Config, MentionPollerSettings
 from strandly_harness.ops import metrics
-from strandly_harness.ops.lambdas.mention_poller import dedup
+from strandly_harness.ops.lambdas.mention_poller import dedup, mention_log
 from strandly_harness.ops.lambdas.mention_poller.sessions import (
     KIND_ISSUE,
     KIND_PR,
@@ -282,13 +282,20 @@ def select_mention(
     """
     candidates: list[Mention] = []
 
-    # (a) issue/PR body
+    # (a) issue/PR body. Timestamp from ``created_at`` ONLY — NOT ``updated_at``: GitHub bumps an
+    # issue/PR's ``updated_at`` on *any* activity (a new comment, a label, a review), so using it
+    # would make the body mention perpetually "fresh" and let it win the newest-wins tie-break over
+    # a genuine follow-up comment posted at the same time — selecting the PR *opener* as the author
+    # instead of the commenter who actually invoked the bot (e.g. a PR whose body merely links
+    # ``@handle`` gets attributed to its author, not to the maintainer who commented "review this").
+    # The body text is fixed at creation for our purposes; a later body edit to add a mention is a
+    # rare case better served by a comment anyway.
     if _mentions_handle(content.get("body"), handle):
         candidates.append(
             Mention(
                 author=(content.get("user") or {}).get("login") or "",
                 source="body",
-                timestamp=_item_ts(content, "updated_at", "created_at"),
+                timestamp=_item_ts(content, "created_at"),
                 body=content.get("body") or "",
             )
         )
@@ -481,8 +488,8 @@ def mark_read(thread_id: str, token: str) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 def _dynamodb_client(config: Config) -> Any | None:
-    """A DynamoDB client for the backstop table, or None if no table is configured."""
-    if not config.mention_poller.dedup_table:
+    """A DynamoDB client for the backstop + mention-log tables, or None if neither is configured."""
+    if not (config.mention_poller.dedup_table or config.mention_poller.mention_log_table):
         return None
     session = config.boto_session()
     if session is not None:
@@ -539,6 +546,25 @@ def process_notification(
     if mention is None or not mention.author:
         mark_read(thread_id, token)
         return "no-mention"
+
+    def _log(outcome: str, *, authorized: bool, session_id: str | None = None) -> None:
+        """Fail-open mention-log write (dashboard Mentions tab) — never blocks the outcome."""
+        mention_log.record(
+            ddb_client,
+            settings.mention_log_table,
+            thread_id=thread_id,
+            outcome=outcome,
+            authorized=authorized,
+            author=mention.author,
+            repo=repo,
+            number=number,
+            is_pull_request=is_pr,
+            mention_ts=mention.timestamp,
+            body=mention.body,
+            url=_html_url(repo, is_pr, number) if repo and number is not None else None,
+            session_id=session_id,
+            now=now,
+        )
     # Authorized if EITHER the static allow-list OR org membership says so. The static list is
     # checked first (no network); only if it fails do we consult the org-membership gate (an
     # ADDITIONAL grant — it can never override an explicit allow, and fails closed on any error).
@@ -546,6 +572,7 @@ def process_notification(
         mention.author, settings.allowed_orgs, token
     ):
         logger.info("unauthorized mention author @%s in %s#%s — skipping", mention.author, repo, number)
+        _log("unauthorized", authorized=False)
         mark_read(thread_id, token)
         return "unauthorized"
 
@@ -553,6 +580,7 @@ def process_notification(
     if is_stale(mention.timestamp, last_read_at) or dedup.already_dispatched(
         ddb_client, settings.dedup_table, thread_id, mention.timestamp
     ):
+        _log("stale", authorized=True)
         mark_read(thread_id, token)
         return "stale"
 
@@ -576,6 +604,7 @@ def process_notification(
             number,
             thread_id,
         )
+        _log("duplicate", authorized=True)
         return "duplicate"
 
     try:
@@ -604,9 +633,11 @@ def process_notification(
             result,
         )
         dedup.clear_dispatch(ddb_client, settings.dedup_table, thread_id)
+        _log("dispatch-error", authorized=True, session_id=session_id)
         return "dispatch-error"
 
     logger.info("dispatched %s for @%s in %s#%s", session_id, mention.author, repo, number)
+    _log("dispatched", authorized=True, session_id=session_id)
     mark_read(thread_id, token)
     return "dispatched"
 

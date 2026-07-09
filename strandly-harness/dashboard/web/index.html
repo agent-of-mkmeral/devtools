@@ -102,12 +102,14 @@
       <button data-tab="runs" class="tab pb-3 border-b-2 border-transparent shrink-0"><i data-lucide="list" class="w-4 h-4"></i>Runs</button>
       <button data-tab="sessions" class="tab pb-3 border-b-2 border-transparent shrink-0"><i data-lucide="messages-square" class="w-4 h-4"></i>Sessions</button>
       <button data-tab="activity" class="tab pb-3 border-b-2 border-transparent shrink-0"><i data-lucide="github" class="w-4 h-4"></i>Activity</button>
+      <button data-tab="mentions" class="tab pb-3 border-b-2 border-transparent shrink-0"><i data-lucide="at-sign" class="w-4 h-4"></i>Mentions</button>
     </nav>
 
     <section id="view-overview"></section>
     <section id="view-runs" class="hidden"></section>
     <section id="view-sessions" class="hidden"></section>
     <section id="view-activity" class="hidden"></section>
+    <section id="view-mentions" class="hidden"></section>
   </div>
 
   <!-- Run detail drawer -->
@@ -420,7 +422,7 @@ function openSessionFromRun(sessionId) {
   closeDrawer();
   activeTab = "sessions";
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === "sessions"));
-  ["overview", "runs", "sessions", "activity"].forEach((t) =>
+  ["overview", "runs", "sessions", "activity", "mentions"].forEach((t) =>
     $("#view-" + t).classList.toggle("hidden", t !== "sessions"));
   rememberSession(sessionId, "");
   renderChat(sessionId);
@@ -587,6 +589,43 @@ async function renderActivity() {
         <div class="text-gray-200 mt-1">${esc(it.title)}</div>
         <div class="text-xs text-gray-500 mt-1">updated ${fmtTime(it.updated_at)}</div>
       </a>`;
+    }).join("");
+  } catch (e) { el.innerHTML = errBox(e); }
+}
+
+// ---------- mentions ----------
+// Every @mention of the agent the poller processed, from the mention-log table (written by the
+// mention poller, read via /api/mentions). Unlike Activity (GitHub public search), this shows the
+// poller's *decision* for each mention — most importantly whether the author was authorized.
+const MENTION_BADGE = { dispatched: "b-completed", "dispatch-error": "b-failed", unauthorized: "b-failed", stale: "b-unknown", duplicate: "b-unknown" };
+async function renderMentions() {
+  const el = $("#view-mentions");
+  el.innerHTML = `<div class="text-gray-500">Loading…</div>`;
+  try {
+    const data = await api("/api/mentions");
+    if (!data.enabled) {
+      el.innerHTML = `<div class="text-gray-500">Mention log not configured — redeploy the Data + Ingress stacks (the poller writes <span class="text-gray-300">STRANDLY_MENTION_LOG_TABLE</span>) and the Dashboard stack to enable this tab.</div>`;
+      return;
+    }
+    const items = data.mentions || [];
+    if (!items.length) { el.innerHTML = `<div class="text-gray-500">No mentions recorded yet — rows appear as the poller processes new @mentions.</div>`; return; }
+    el.innerHTML = items.map((m) => {
+      const kind = m.is_pull_request ? "PR" : "Issue";
+      const target = `${m.repo || "?"} · ${kind}${m.number != null ? " #" + m.number : ""}`;
+      const auth = m.authorized
+        ? `<span class="badge b-completed">authorized</span>`
+        : `<span class="badge b-failed">unauthorized</span>`;
+      const outcome = `<span class="badge ${MENTION_BADGE[m.outcome] || "b-unknown"}">${esc(m.outcome || "unknown")}</span>`;
+      const inner = `
+        <div class="flex items-center justify-between gap-2 flex-wrap">
+          <span class="text-xs text-gray-500">${esc(target)}</span>
+          <span class="flex gap-1.5">${auth}${outcome}</span>
+        </div>
+        <div class="text-gray-200 mt-1">@${esc(m.author || "unknown")}${m.body ? `: <span class="text-gray-400">${esc(m.body.slice(0, 200))}${m.body.length > 200 ? "…" : ""}</span>` : ""}</div>
+        <div class="text-xs text-gray-500 mt-1">mentioned ${fmtTime(m.mention_ts)} · seen ${fmtTime(m.seen_at)}${m.session_id ? ` · session <span class="text-gray-400">${esc(m.session_id)}</span>` : ""}</div>`;
+      return m.url
+        ? `<a href="${esc(m.url)}" target="_blank" class="card p-4 mb-3 block hover:border-indigo-600 transition">${inner}</a>`
+        : `<div class="card p-4 mb-3">${inner}</div>`;
     }).join("");
   } catch (e) { el.innerHTML = errBox(e); }
 }
@@ -955,12 +994,12 @@ async function pollChat(id, taskId) {
   return { text: "Still working — check the Runs tab shortly for the result.", failed: false };
 }
 
-const RENDER = { overview: renderOverview, runs: renderRuns, sessions: renderSessions, activity: renderActivity };
+const RENDER = { overview: renderOverview, runs: renderRuns, sessions: renderSessions, activity: renderActivity, mentions: renderMentions };
 let activeTab = "overview";
 function showTab(tab) {
   activeTab = tab;
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  ["overview", "runs", "sessions", "activity"].forEach((t) =>
+  ["overview", "runs", "sessions", "activity", "mentions"].forEach((t) =>
     $("#view-" + t).classList.toggle("hidden", t !== tab));
   RENDER[tab]();
 }

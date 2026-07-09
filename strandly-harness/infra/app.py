@@ -184,6 +184,7 @@ if exec_role_name:
         exec_role_name=exec_role_name,
         kb_id=ctx("kb_id"),
         run_ledger_table=ctx("run_ledger_table") or naming.run_ledger_table,
+        config_secret_arn=ctx("secret_arn"),
         env=env,
     )
 

@@ -8,6 +8,9 @@ description: >
   needed — just run pytest) or when the sandbox has no AWS credentials. Hard rule: every AWS
   resource you create MUST be tagged ManagedBy=strandly and named strandly-managed-* — the IAM role
   enforces it, and it's what stops you from touching production.
+compatibility: >
+  Requires the sandbox deployed with the CI Bedrock role (-c ci_bedrock_role=true) so scoped AWS
+  credentials are present; without them, run unit tests instead.
 allowed-tools: bash file_editor use_github think
 ---
 

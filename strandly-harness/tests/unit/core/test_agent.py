@@ -49,6 +49,9 @@ async def test_prompt_global_plus_dynamic_capabilities(fake_model, tmp_path):
     assert "use_github" not in prompt  # gated off (no token)
     # Runtime env context is injected per-turn by EventContext, NOT in the static prompt.
     assert "# Environment" not in prompt
+    # Local sandbox (no AGENTCORE_CODE_INTERPRETER_ID) = the user's real disk, which persists, so
+    # the ephemeral-sandbox guidance must NOT appear. It's gated on the AgentCore sandbox.
+    assert "Your sandbox is ephemeral" not in str(prompt)
 
 
 @pytest.mark.asyncio

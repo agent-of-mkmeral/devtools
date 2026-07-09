@@ -48,6 +48,12 @@ GSI_NAME = "recent"
 GSI_PK_ATTR = "gsi_pk"
 GSI_PK_VALUE = "RUN"
 
+# Mention-log table (the poller writes one row per processed @mention; the Mentions tab reads it).
+# Mirrors strandly_harness.core.constants.MENTION_LOG_GSI_NAME / MENTION_LOG_GSI_PK_VALUE (canonical,
+# also mirrored in infra/stacks/common.py) — tests/test_infra_constants_sync guards the copies.
+MENTION_LOG_GSI_NAME = "recent"
+MENTION_LOG_GSI_PK_VALUE = "MENTION"
+
 # AgentCore Runtime session ids must be slash-free and at least this many chars or
 # InvokeAgentRuntime throws an opaque ValidationException. Mirrors
 # strandly_harness.core.constants.RUNTIME_SESSION_ID_MIN_LEN (guarded by tests/test_infra_constants_sync).
@@ -127,6 +133,24 @@ class LedgerReader:
     def get(self, task_id: str) -> dict[str, Any] | None:
         resp = self._table.get_item(Key={"task_id": task_id})
         return resp.get("Item")
+
+
+class MentionLogReader:
+    """Read-side wrapper over the mention-log table (poller-written). Table injectable for tests."""
+
+    def __init__(self, table: Any):
+        self._table = table
+
+    def recent(self, limit: int) -> list[dict[str, Any]]:
+        from boto3.dynamodb.conditions import Key
+
+        resp = self._table.query(
+            IndexName=MENTION_LOG_GSI_NAME,
+            KeyConditionExpression=Key(GSI_PK_ATTR).eq(MENTION_LOG_GSI_PK_VALUE),
+            ScanIndexForward=False,  # newest first (seen_at descending)
+            Limit=limit,
+        )
+        return resp.get("Items", [])
 
 
 class RuntimeInvoker:
@@ -624,6 +648,7 @@ def route(
     memory: MemoryReader | None = None,
     logs: LogsReader | None = None,
     alarms: AlarmsReader | None = None,
+    mentions: MentionLogReader | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Pure router: (status_code, body) for an HTTP API v2 event. No AWS unless reader/invoker/memory used."""
     http = (event.get("requestContext") or {}).get("http") or {}
@@ -647,6 +672,14 @@ def route(
     # Health reads CloudWatch, not the ledger — it must work (and degrade) independently of it.
     if path.endswith("/health"):
         return 200, _health(alarms)
+
+    # Mentions read the poller's mention-log table, not the ledger. Unconfigured → an explicit
+    # enabled:false (the tab renders a hint instead of an error) — the feature degrades cleanly.
+    if path.endswith("/mentions"):
+        if mentions is None:
+            return 200, {"mentions": [], "enabled": False}
+        limit = _clamp_limit((event.get("queryStringParameters") or {}).get("limit"))
+        return 200, {"mentions": mentions.recent(limit), "enabled": True}
 
     if reader is None:  # config/chat/health are the only routes that don't need the table
         return 500, {"error": "ledger table not configured"}
@@ -756,6 +789,16 @@ def _build_reader() -> LedgerReader | None:
     return LedgerReader(boto3.resource("dynamodb").Table(table_name))
 
 
+def _build_mentions_reader() -> MentionLogReader | None:
+    """A mention-log reader when ``MENTION_LOG_TABLE`` is set, else ``None`` (tab shows a hint)."""
+    table_name = os.environ.get("MENTION_LOG_TABLE")
+    if not table_name:
+        return None
+    import boto3
+
+    return MentionLogReader(boto3.resource("dynamodb").Table(table_name))
+
+
 def _build_invoker() -> RuntimeInvoker | None:
     runtime_arn = os.environ.get("STRANDLY_RUNTIME_ARN")
     if not runtime_arn:
@@ -798,6 +841,7 @@ def lambda_handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]
         _build_memory_reader(),
         _build_logs_reader(),
         _build_alarms_reader(),
+        _build_mentions_reader(),
     )
     return {
         "statusCode": status,
